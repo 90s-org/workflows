@@ -26,6 +26,6 @@ jobs:
 
       - name: check files
         run: |
-          ls -l
+          ls -la
 
       

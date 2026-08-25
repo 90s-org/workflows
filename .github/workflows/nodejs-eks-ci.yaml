@@ -1,0 +1,250 @@
+name: nodejs-eks-ci
+# Reusable workflow, called by a component repo's own workflow file — the
+# GitHub Actions equivalent of nodejsEKSPipeline.groovy in jenkins-shared-library.
+# One parameterized definition instead of copy-pasting build/test/deploy steps
+# into every nodejs service's own workflow.
+#
+# Secrets this workflow needs from the caller (pass `secrets: inherit` from a
+# caller in the same org, or list them explicitly):
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  - ECR push (same shape as Jenkins' aws-creds)
+#   GH_PAT           - push to roboshop-helm, read dependabot alerts, trigger
+#                       catalogue-api-tests; needs repo scope across the 90s-org repos
+#                       this touches (same single-shared-credential shape as Jenkins'
+#                       github-token — see release-pipeline-spec.md Known Gaps)
+#   ARGOCD_SERVER / ARGOCD_AUTH_TOKEN - poll the ArgoCD Application after the gitops push
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: 'Project name'
+        required: true
+        type: string
+      component:
+        description: 'Component name'
+        required: true
+        type: string
+      # argocd-app:
+      #   description: 'ArgoCD Application name to wait on after the dev-deploy push'
+      #   required: false
+      #   type: string
+      #   default: 'catalogue'
+    # secrets:
+    #   AWS_ACCESS_KEY_ID:
+    #     required: true
+    #   AWS_SECRET_ACCESS_KEY:
+    #     required: true
+    #   GH_PAT:
+    #     required: true
+    #   ARGOCD_SERVER:
+    #     required: true
+    #   ARGOCD_AUTH_TOKEN:
+    #     required: true
+
+env:
+  project: ${{ inputs.project }}
+  component: ${{ inputs.component }}
+  aws_region: us-east-1
+  org: 90s-org
+
+jobs:
+  build-test-deploy:
+    runs-on:
+      group: roboshop
+      labels: nodejs
+    # permissions:
+    #   contents: write
+    #   pull-requests: write
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+
+      # - name: setup node
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: '18'
+
+      # mirrors 'read-version' stage — appVersion tags dev images/deploys,
+      # same as packageJson.version did in the Jenkinsfile
+      - name: read-version
+        id: version
+        run: echo "app_version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: install-dependencies
+        run: npm install
+
+      # jest-junit is already configured in package.json; upload the report the
+      # same way Jenkins' junit step archived it, so failures are inspectable
+      # from the run summary without re-running locally
+      - name: unit-tests
+        run: npm test
+      - name: upload unit test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: junit.xml
+          if-no-files-found: ignore
+
+      # mirrors 'library-scan' stage — fail on open high/critical dependabot alerts
+      # - name: library-scan
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GH_PAT }}
+      #   run: |
+      #     set -e
+      #     REPO="${org}/${component}"
+
+      #     curl -s -L \
+      #       -H "Accept: application/vnd.github+json" \
+      #       -H "Authorization: Bearer ${GH_TOKEN}" \
+      #       -H "X-GitHub-Api-Version: 2022-11-28" \
+      #       "https://api.github.com/repos/${REPO}/dependabot/alerts?state=open" \
+      #       -o alerts.json
+
+      #     echo "---- Open Dependabot Alerts ----"
+      #     jq -r '.[] | "\(.number)\t\(.security_vulnerability.severity)\t\(.dependency.package.name)\t\(.security_advisory.ghsa_id)"' alerts.json
+
+      #     HIGH_CRITICAL_COUNT=$(jq '[.[] | select(.security_vulnerability.severity == "high" or .security_vulnerability.severity == "critical")] | length' alerts.json)
+      #     echo "High/Critical alert count: ${HIGH_CRITICAL_COUNT}"
+
+      #     if [ "$HIGH_CRITICAL_COUNT" -gt 0 ]; then
+      #       echo "Found ${HIGH_CRITICAL_COUNT} High/Critical severity dependency alert(s). Failing build."
+      #       exit 1
+      #     fi
+
+      # - name: configure aws credentials
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.aws_region }}
+
+      # - name: ecr login
+      #   id: ecr
+      #   uses: aws-actions/amazon-ecr-login@v2
+
+      # - name: build-image
+      #   run: |
+      #     docker build -t ${{ steps.ecr.outputs.registry }}/${project}/${component}:${{ steps.version.outputs.app_version }} .
+
+      # # mirrors 'trivy-scan' stage — same two checks: image vuln scan, Dockerfile config scan
+      # - name: trivy-scan image
+      #   uses: aquasecurity/trivy-action@0.24.0
+      #   with:
+      #     scan-type: image
+      #     image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
+      #     severity: HIGH,CRITICAL
+      #     exit-code: 1
+      #     format: table
+      #     output: trivy-image-report.txt
+
+      # - name: trivy-scan dockerfile
+      #   uses: aquasecurity/trivy-action@0.24.0
+      #   with:
+      #     scan-type: config
+      #     scan-ref: Dockerfile
+      #     severity: HIGH,CRITICAL
+      #     exit-code: 1
+      #     format: table
+      #     output: trivy-dockerfile-report.txt
+
+      # - name: upload trivy reports
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: trivy-reports
+      #     path: trivy-*.txt
+      #     if-no-files-found: ignore
+
+      # - name: push-image-to-ecr
+      #   run: |
+      #     docker push ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
+
+      # # mirrors 'dev-deploy' stage, but GitOps-style: no direct helm/kubectl from
+      # # CI. Commit the new image straight to roboshop-helm main (dev has no
+      # # approval gate, so no PR-and-merge cycle needed here — see
+      # # argocd-gitops-spec.md's non-goals) and let the already-automated
+      # # catalogue ArgoCD Application pick it up.
+      # - name: checkout roboshop-helm
+      #   uses: actions/checkout@v4
+      #   with:
+      #     repository: ${{ env.org }}/roboshop-helm
+      #     token: ${{ secrets.GH_PAT }}
+      #     path: roboshop-helm
+
+      # - name: update-config-repo
+      #   id: gitops
+      #   working-directory: roboshop-helm
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GH_PAT }}
+      #   run: |
+      #     set -e
+      #     command -v yq >/dev/null || (sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq)
+
+      #     yq -i ".deployment.imageName = \"${{ steps.ecr.outputs.registry }}/${project}/${component}\"" ${component}/values-dev.yaml
+      #     yq -i ".deployment.imageVersion = \"${{ steps.version.outputs.app_version }}\"" ${component}/values-dev.yaml
+
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git commit -am "Deploy ${component}@${{ steps.version.outputs.app_version }} to dev (${{ github.sha }})"
+      #     git push origin main
+      #     echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # # mirrors 'kubectl rollout status' — confirm ArgoCD actually synced the
+      # # commit that was just pushed, not just that the app happens to be
+      # # healthy on an older revision
+      # - name: wait-for-argocd-sync
+      #   env:
+      #     ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+      #     ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      #   run: |
+      #     set -e
+      #     curl -sSL -o argocd https://${ARGOCD_SERVER}/download/argocd-linux-amd64
+      #     chmod +x argocd
+      #     sudo mv argocd /usr/local/bin/argocd
+
+      #     argocd app wait ${{ inputs.argocd-app }} --health --timeout 300
+      #     synced_revision=$(argocd app get ${{ inputs.argocd-app }} -o json | jq -r '.status.sync.revision')
+
+      #     if [ "$synced_revision" != "${{ steps.gitops.outputs.commit_sha }}" ]; then
+      #       echo "ArgoCD synced revision ($synced_revision) does not match the commit that was just pushed (${{ steps.gitops.outputs.commit_sha }})"
+      #       exit 1
+      #     fi
+      #     echo "ArgoCD app ${{ inputs.argocd-app }} healthy and synced at ${synced_revision}"
+
+      # # mirrors 'api-tests' stage — same cross-job hand-off as Jenkins'
+      # # `build job: 'ROBOSHOP/catalogue-api-tests'`, just via a workflow_dispatch
+      # # in that repo (owned by SDET) instead of a Jenkins job
+      # - name: trigger catalogue-api-tests
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GH_PAT }}
+      #   run: |
+      #     set -e
+      #     gh workflow run api-tests.yml \
+      #       --repo ${org}/catalogue-api-tests \
+      #       --ref main \
+      #       -f namespace=roboshop-dev \
+      #       -f commit_id=${{ github.sha }}
+
+      #     sleep 10
+      #     run_id=$(gh run list --repo ${org}/catalogue-api-tests --workflow=api-tests.yml --json databaseId,createdAt --jq 'sort_by(.createdAt) | last | .databaseId')
+      #     echo "watching catalogue-api-tests run $run_id"
+      #     gh run watch "$run_id" --repo ${org}/catalogue-api-tests --exit-status
+
+      # # mirrors 'raise-pr' stage — same create-or-find semantics as
+      # # utils.createPullRequest(), scoped to this repo so the default token is enough
+      # - name: raise-pr
+      #   if: github.ref_name != 'main'
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     set -e
+      #     existing=$(gh pr list --head "${{ github.ref_name }}" --base main --state open --json number --jq 'length')
+      #     if [ "$existing" -gt 0 ]; then
+      #       echo "PR already open for ${{ github.ref_name }} -> main"
+      #     else
+      #       body=$(printf 'Automated PR after successful dev-deploy and api-tests.\n\nRun: %s/%s/actions/runs/%s' \
+      #         "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
+      #       gh pr create --base main --head "${{ github.ref_name }}" \
+      #         --title "${component}: ${{ github.ref_name }} -> main" \
+      #         --body "$body"
+      #     fi

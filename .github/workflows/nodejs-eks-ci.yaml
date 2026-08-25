@@ -28,13 +28,13 @@ on:
       #   required: false
       #   type: string
       #   default: 'catalogue'
-    # secrets:
-    #   AWS_ACCESS_KEY_ID:
-    #     required: true
-    #   AWS_SECRET_ACCESS_KEY:
-    #     required: true
-    #   GH_PAT:
-    #     required: true
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      GH_PAT:
+        required: true
     #   ARGOCD_SERVER:
     #     required: true
     #   ARGOCD_AUTH_TOKEN:
@@ -86,78 +86,78 @@ jobs:
           if-no-files-found: ignore
 
       # mirrors 'library-scan' stage — fail on open high/critical dependabot alerts
-      # - name: library-scan
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GH_PAT }}
-      #   run: |
-      #     set -e
-      #     REPO="${org}/${component}"
+      - name: library-scan
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -e
+          REPO="${org}/${component}"
 
-      #     curl -s -L \
-      #       -H "Accept: application/vnd.github+json" \
-      #       -H "Authorization: Bearer ${GH_TOKEN}" \
-      #       -H "X-GitHub-Api-Version: 2022-11-28" \
-      #       "https://api.github.com/repos/${REPO}/dependabot/alerts?state=open" \
-      #       -o alerts.json
+          curl -s -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/dependabot/alerts?state=open" \
+            -o alerts.json
 
-      #     echo "---- Open Dependabot Alerts ----"
-      #     jq -r '.[] | "\(.number)\t\(.security_vulnerability.severity)\t\(.dependency.package.name)\t\(.security_advisory.ghsa_id)"' alerts.json
+          echo "---- Open Dependabot Alerts ----"
+          jq -r '.[] | "\(.number)\t\(.security_vulnerability.severity)\t\(.dependency.package.name)\t\(.security_advisory.ghsa_id)"' alerts.json
 
-      #     HIGH_CRITICAL_COUNT=$(jq '[.[] | select(.security_vulnerability.severity == "high" or .security_vulnerability.severity == "critical")] | length' alerts.json)
-      #     echo "High/Critical alert count: ${HIGH_CRITICAL_COUNT}"
+          HIGH_CRITICAL_COUNT=$(jq '[.[] | select(.security_vulnerability.severity == "high" or .security_vulnerability.severity == "critical")] | length' alerts.json)
+          echo "High/Critical alert count: ${HIGH_CRITICAL_COUNT}"
 
-      #     if [ "$HIGH_CRITICAL_COUNT" -gt 0 ]; then
-      #       echo "Found ${HIGH_CRITICAL_COUNT} High/Critical severity dependency alert(s). Failing build."
-      #       exit 1
-      #     fi
+          if [ "$HIGH_CRITICAL_COUNT" -gt 0 ]; then
+            echo "Found ${HIGH_CRITICAL_COUNT} High/Critical severity dependency alert(s). Failing build."
+            exit 1
+          fi
 
-      # - name: configure aws credentials
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      #     aws-region: ${{ env.aws_region }}
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.aws_region }}
 
-      # - name: ecr login
-      #   id: ecr
-      #   uses: aws-actions/amazon-ecr-login@v2
+      - name: ecr login
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # - name: build-image
-      #   run: |
-      #     docker build -t ${{ steps.ecr.outputs.registry }}/${project}/${component}:${{ steps.version.outputs.app_version }} .
+      - name: build-image
+        run: |
+          docker build -t ${{ steps.ecr.outputs.registry }}/${project}/${component}:${{ steps.version.outputs.app_version }} .
 
       # # mirrors 'trivy-scan' stage — same two checks: image vuln scan, Dockerfile config scan
-      # - name: trivy-scan image
-      #   uses: aquasecurity/trivy-action@0.24.0
-      #   with:
-      #     scan-type: image
-      #     image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
-      #     severity: HIGH,CRITICAL
-      #     exit-code: 1
-      #     format: table
-      #     output: trivy-image-report.txt
+      - name: trivy-scan image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          format: table
+          output: trivy-image-report.txt
 
-      # - name: trivy-scan dockerfile
-      #   uses: aquasecurity/trivy-action@0.24.0
-      #   with:
-      #     scan-type: config
-      #     scan-ref: Dockerfile
-      #     severity: HIGH,CRITICAL
-      #     exit-code: 1
-      #     format: table
-      #     output: trivy-dockerfile-report.txt
+      - name: trivy-scan dockerfile
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: Dockerfile
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          format: table
+          output: trivy-dockerfile-report.txt
 
-      # - name: upload trivy reports
-      #   if: always()
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: trivy-reports
-      #     path: trivy-*.txt
-      #     if-no-files-found: ignore
+      - name: upload trivy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports
+          path: trivy-*.txt
+          if-no-files-found: ignore
 
-      # - name: push-image-to-ecr
-      #   run: |
-      #     docker push ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
+      - name: push-image-to-ecr
+        run: |
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
 
       # # mirrors 'dev-deploy' stage, but GitOps-style: no direct helm/kubectl from
       # # CI. Commit the new image straight to roboshop-helm main (dev has no

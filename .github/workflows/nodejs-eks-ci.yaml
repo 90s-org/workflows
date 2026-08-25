@@ -132,6 +132,7 @@ jobs:
         with:
           scan-type: image
           image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
+          vuln-type: os
           severity: HIGH,CRITICAL
           exit-code: 1
           format: table

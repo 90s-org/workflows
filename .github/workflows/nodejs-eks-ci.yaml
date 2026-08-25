@@ -128,7 +128,7 @@ jobs:
 
       # # mirrors 'trivy-scan' stage — same two checks: image vuln scan, Dockerfile config scan
       - name: trivy-scan image
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
@@ -138,7 +138,7 @@ jobs:
           output: trivy-image-report.txt
 
       - name: trivy-scan dockerfile
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: Dockerfile

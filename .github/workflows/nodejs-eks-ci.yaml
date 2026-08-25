@@ -7,7 +7,7 @@ name: nodejs-eks-ci
 # Secrets this workflow needs from the caller (pass `secrets: inherit` from a
 # caller in the same org, or list them explicitly):
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  - ECR push (same shape as Jenkins' aws-creds)
-#   GH_PAT           - push to roboshop-helm, read dependabot alerts, trigger
+#   GH_PAT           - push to catalogue-config, read dependabot alerts, trigger
 #                       catalogue-api-tests; needs repo scope across the 90s-org repos
 #                       this touches (same single-shared-credential shape as Jenkins'
 #                       github-token — see release-pipeline-spec.md Known Gaps)
@@ -44,6 +44,8 @@ env:
   project: ${{ inputs.project }}
   component: ${{ inputs.component }}
   aws_region: us-east-1
+  acc_id: "160885265516"
+  registry: 160885265516.dkr.ecr.us-east-1.amazonaws.com
   org: 90s-org
 
 jobs:
@@ -119,19 +121,19 @@ jobs:
           aws-region: ${{ env.aws_region }}
 
       - name: ecr login
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        run: |
+          aws ecr get-login-password --region ${aws_region} | docker login --username AWS --password-stdin ${registry}
 
       - name: build-image
         run: |
-          docker build -t ${{ steps.ecr.outputs.registry }}/${project}/${component}:${{ steps.version.outputs.app_version }} .
+          docker build -t ${registry}/${project}/${component}:${{ steps.version.outputs.app_version }} .
 
       # # mirrors 'trivy-scan' stage — same two checks: image vuln scan, Dockerfile config scan
       - name: trivy-scan image
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
-          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
+          image-ref: ${{ env.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
           vuln-type: os
           severity: HIGH,CRITICAL
           exit-code: 1
@@ -158,37 +160,34 @@ jobs:
 
       - name: push-image-to-ecr
         run: |
-          docker push ${{ steps.ecr.outputs.registry }}/${{ env.project }}/${{ env.component }}:${{ steps.version.outputs.app_version }}
+          docker push ${registry}/${project}/${component}:${{ steps.version.outputs.app_version }}
 
-      # # mirrors 'dev-deploy' stage, but GitOps-style: no direct helm/kubectl from
-      # # CI. Commit the new image straight to roboshop-helm main (dev has no
-      # # approval gate, so no PR-and-merge cycle needed here — see
-      # # argocd-gitops-spec.md's non-goals) and let the already-automated
-      # # catalogue ArgoCD Application pick it up.
-      # - name: checkout roboshop-helm
-      #   uses: actions/checkout@v4
-      #   with:
-      #     repository: ${{ env.org }}/roboshop-helm
-      #     token: ${{ secrets.GH_PAT }}
-      #     path: roboshop-helm
+      # mirrors 'dev-deploy' stage, but GitOps-style: no direct helm/kubectl from
+      # CI. Commit the new image straight to catalogue-config main (dev has no
+      # approval gate, so no PR-and-merge cycle needed here — see
+      # argocd-gitops-spec.md's non-goals) and let the already-automated
+      # catalogue ArgoCD Application pick it up. imageName is constant
+      # (already seeded in catalogue-config) — only imageVersion changes per
+      # deploy, so that's the only key touched here.
+      - name: checkout catalogue-config
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.org }}/catalogue-config
+          token: ${{ secrets.GH_PAT }}
+          path: catalogue-config
 
-      # - name: update-config-repo
-      #   id: gitops
-      #   working-directory: roboshop-helm
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GH_PAT }}
-      #   run: |
-      #     set -e
-      #     command -v yq >/dev/null || (sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq)
+      - name: update-config-repo
+        id: gitops
+        working-directory: catalogue-config
+        run: |
+          set -e
+          yq -i ".deployment.imageVersion = \"${{ steps.version.outputs.app_version }}\"" values-dev.yaml
 
-      #     yq -i ".deployment.imageName = \"${{ steps.ecr.outputs.registry }}/${project}/${component}\"" ${component}/values-dev.yaml
-      #     yq -i ".deployment.imageVersion = \"${{ steps.version.outputs.app_version }}\"" ${component}/values-dev.yaml
-
-      #     git config user.name "github-actions[bot]"
-      #     git config user.email "github-actions[bot]@users.noreply.github.com"
-      #     git commit -am "Deploy ${component}@${{ steps.version.outputs.app_version }} to dev (${{ github.sha }})"
-      #     git push origin main
-      #     echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "Deploy ${component}@${{ steps.version.outputs.app_version }} to dev (${{ github.sha }})"
+          git push origin main
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # # mirrors 'kubectl rollout status' — confirm ArgoCD actually synced the
       # # commit that was just pushed, not just that the app happens to be

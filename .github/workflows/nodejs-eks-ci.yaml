@@ -53,9 +53,10 @@ jobs:
     runs-on:
       group: roboshop
       labels: nodejs
-    # permissions:
-    #   contents: write
-    #   pull-requests: write
+    permissions:
+      statuses: write
+    # contents: write
+    # pull-requests: write
     steps:
       - name: checkout code
         uses: actions/checkout@v4
@@ -78,6 +79,7 @@ jobs:
       # same way Jenkins' junit step archived it, so failures are inspectable
       # from the run summary without re-running locally
       - name: unit-tests
+        id: unit-tests
         run: npm test
       - name: upload unit test report
         if: always()
@@ -86,9 +88,18 @@ jobs:
           name: unit-test-report
           path: junit.xml
           if-no-files-found: ignore
+      - name: status-unit-tests
+        if: steps.unit-tests.outcome == 'success' || steps.unit-tests.outcome == 'failure'
+        uses: 90s-org/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.unit-tests.outcome }}
+          context: unit-tests
+          description: ${{ steps.unit-tests.outcome == 'success' && 'Unit tests passed' || 'Unit tests failed' }}
+          token: ${{ github.token }}
 
       # mirrors 'library-scan' stage — fail on open high/critical dependabot alerts
       - name: library-scan
+        id: library-scan
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
@@ -112,6 +123,14 @@ jobs:
             echo "Found ${HIGH_CRITICAL_COUNT} High/Critical severity dependency alert(s). Failing build."
             exit 1
           fi
+      - name: status-library-scan
+        if: steps.library-scan.outcome == 'success' || steps.library-scan.outcome == 'failure'
+        uses: 90s-org/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.library-scan.outcome }}
+          context: library-scan
+          description: ${{ steps.library-scan.outcome == 'success' && 'Library scan passed' || 'Library scan failed' }}
+          token: ${{ github.token }}
 
       # - name: configure aws credentials
       #   uses: aws-actions/configure-aws-credentials@v4
@@ -125,11 +144,21 @@ jobs:
           aws ecr get-login-password --region ${aws_region} | docker login --username AWS --password-stdin ${registry}
 
       - name: build-image
+        id: build-image
         run: |
           docker build -t ${registry}/${project}/${component}:${{ steps.version.outputs.app_version }} .
+      - name: status-build-image
+        if: steps.build-image.outcome == 'success' || steps.build-image.outcome == 'failure'
+        uses: 90s-org/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.build-image.outcome }}
+          context: build-image
+          description: ${{ steps.build-image.outcome == 'success' && 'Docker image build' || 'Docker image build failed' }}
+          token: ${{ github.token }}
 
       # # mirrors 'trivy-scan' stage — same two checks: image vuln scan, Dockerfile config scan
       - name: trivy-scan image
+        id: trivy-scan-image
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
@@ -141,6 +170,7 @@ jobs:
           output: trivy-image-report.txt
 
       - name: trivy-scan dockerfile
+        id: trivy-scan-dockerfile
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
@@ -157,10 +187,27 @@ jobs:
           name: trivy-reports
           path: trivy-*.txt
           if-no-files-found: ignore
+      - name: status-trivy-scan
+        if: steps.trivy-scan-image.outcome == 'success' || steps.trivy-scan-image.outcome == 'failure'
+        uses: 90s-org/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ (steps.trivy-scan-image.outcome == 'success' && steps.trivy-scan-dockerfile.outcome == 'success') && 'success' || 'failure' }}
+          context: trivy-scan
+          description: ${{ (steps.trivy-scan-image.outcome == 'success' && steps.trivy-scan-dockerfile.outcome == 'success') && 'trivy scan success' || 'trivy scan failed' }}
+          token: ${{ github.token }}
 
       - name: push-image-to-ecr
+        id: push-image
         run: |
           docker push ${registry}/${project}/${component}:${{ steps.version.outputs.app_version }}
+      - name: status-push-image
+        if: steps.push-image.outcome == 'success' || steps.push-image.outcome == 'failure'
+        uses: 90s-org/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.push-image.outcome }}
+          context: push-image
+          description: ${{ steps.push-image.outcome == 'success' && 'push image to ECR' || 'push image to ECR failed' }}
+          token: ${{ github.token }}
 
       # mirrors 'dev-deploy' stage, but GitOps-style: no direct helm/kubectl from
       # CI. Commit the new image straight to catalogue-config main (dev has no
@@ -177,7 +224,7 @@ jobs:
           path: catalogue-config
 
       - name: update-config-repo
-        id: gitops
+        id: gitops-update
         working-directory: catalogue-config
         run: |
           set -e
@@ -188,11 +235,20 @@ jobs:
           git commit -am "Deploy ${component}@${{ steps.version.outputs.app_version }} to dev (${{ github.sha }})"
           git push origin main
           echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: status-update-config
+        if: steps.gitops-update.outcome == 'success' || steps.gitops-update.outcome == 'failure'
+        uses: 90s-org/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.gitops-update.outcome }}
+          context: update-config
+          description: ${{ steps.gitops-update.outcome == 'success' && 'catalogue-config updated' || 'Failed to update catalogue-config' }}
+          token: ${{ github.token }}
 
       # mirrors 'kubectl rollout status' — force a sync of the commit that was
       # just pushed (don't wait on the 45s auto-sync poll) and fail the
       # workflow if it isn't Healthy within 5 minutes
       - name: sync-and-wait-argocd
+        id: sync-and-wait-argocd
         env:
           ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -204,6 +260,14 @@ jobs:
 
           argocd app sync ${{ inputs.argocd-app }} --insecure
           argocd app wait ${{ inputs.argocd-app }} --health --timeout 300 --insecure
+      - name: status-dev-deploy
+        if: steps.sync-and-wait-argocd.outcome == 'success' || steps.sync-and-wait-argocd.outcome == 'failure'
+        uses: 90s-org/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.sync-and-wait-argocd.outcome }}
+          context: dev-deploy
+          description: ${{ steps.sync-and-wait-argocd.outcome == 'success' && 'Deployed to roboshop-dev' || 'Deploy to roboshop-dev failed' }}
+          token: ${{ github.token }}
 
       # catalogue's Service is a stable ClusterIP (templates/service.yaml in
       # catalogue-config), so its cluster-DNS name is deterministic — no need
@@ -219,11 +283,12 @@ jobs:
       # `build job: 'ROBOSHOP/catalogue-api-tests'`, just via a workflow_dispatch
       # in that repo (owned by SDET) instead of a Jenkins job
       - name: trigger catalogue-api-tests
+        id: api-tests
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -e
-          gh workflow run api-tests.yml \
+          gh workflow run api-tests.yaml \
             --repo ${org}/catalogue-api-tests \
             --ref main \
             -f namespace=roboshop-dev \
@@ -231,9 +296,17 @@ jobs:
             -f catalogue_url=${{ steps.endpoint.outputs.catalogue_url }}
 
           sleep 10
-          run_id=$(gh run list --repo ${org}/catalogue-api-tests --workflow=api-tests.yml --json databaseId,createdAt --jq 'sort_by(.createdAt) | last | .databaseId')
+          run_id=$(gh run list --repo ${org}/catalogue-api-tests --workflow=api-tests.yaml --json databaseId,createdAt --jq 'sort_by(.createdAt) | last | .databaseId')
           echo "watching catalogue-api-tests run $run_id"
           gh run watch "$run_id" --repo ${org}/catalogue-api-tests --exit-status
+      - name: status-api-tests
+        if: steps.api-tests.outcome == 'success' || steps.api-tests.outcome == 'failure'
+        uses: 90s-org/workflows/.github/actions/commit-status@main
+        with:
+          state: ${{ steps.api-tests.outcome }}
+          context: api-tests
+          description: ${{ steps.api-tests.outcome == 'success' && 'catalogue-api-tests passed' || 'catalogue-api-tests failed' }}
+          token: ${{ github.token }}
 
       # # mirrors 'raise-pr' stage — same create-or-find semantics as
       # # utils.createPullRequest(), scoped to this repo so the default token is enough

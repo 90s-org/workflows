@@ -23,11 +23,11 @@ on:
         description: 'Component name'
         required: true
         type: string
-      # argocd-app:
-      #   description: 'ArgoCD Application name to wait on after the dev-deploy push'
-      #   required: false
-      #   type: string
-      #   default: 'catalogue'
+      argocd-app:
+        description: 'ArgoCD Application name to sync and wait on after the dev-deploy push'
+        required: false
+        type: string
+        default: 'catalogue'
     secrets:
       # AWS_ACCESS_KEY_ID:
       #   required: true
@@ -35,10 +35,10 @@ on:
       #   required: true
       GH_PAT:
         required: true
-    #   ARGOCD_SERVER:
-    #     required: true
-    #   ARGOCD_AUTH_TOKEN:
-    #     required: true
+      ARGOCD_SERVER:
+        required: true
+      ARGOCD_AUTH_TOKEN:
+        required: true
 
 env:
   project: ${{ inputs.project }}
@@ -189,46 +189,62 @@ jobs:
           git push origin main
           echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # # mirrors 'kubectl rollout status' — confirm ArgoCD actually synced the
-      # # commit that was just pushed, not just that the app happens to be
-      # # healthy on an older revision
-      # - name: wait-for-argocd-sync
-      #   env:
-      #     ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-      #     ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-      #   run: |
-      #     set -e
-      #     curl -sSL -o argocd https://${ARGOCD_SERVER}/download/argocd-linux-amd64
-      #     chmod +x argocd
-      #     sudo mv argocd /usr/local/bin/argocd
+      # mirrors 'kubectl rollout status' — force a sync of the commit that was
+      # just pushed (don't wait on the 45s auto-sync poll) and fail the
+      # workflow if it isn't Healthy within 5 minutes
+      - name: sync-and-wait-argocd
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -e
+          curl -sSLk -o argocd https://${ARGOCD_SERVER}/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/argocd
 
-      #     argocd app wait ${{ inputs.argocd-app }} --health --timeout 300
-      #     synced_revision=$(argocd app get ${{ inputs.argocd-app }} -o json | jq -r '.status.sync.revision')
+          argocd app sync ${{ inputs.argocd-app }} --insecure
+          argocd app wait ${{ inputs.argocd-app }} --health --timeout 300 --insecure
 
-      #     if [ "$synced_revision" != "${{ steps.gitops.outputs.commit_sha }}" ]; then
-      #       echo "ArgoCD synced revision ($synced_revision) does not match the commit that was just pushed (${{ steps.gitops.outputs.commit_sha }})"
-      #       exit 1
-      #     fi
-      #     echo "ArgoCD app ${{ inputs.argocd-app }} healthy and synced at ${synced_revision}"
+      # resolve the running catalogue pod's IP via ArgoCD's own view of the
+      # live cluster state (its cluster cache carries full object status,
+      # not just the health/sync summary) — no separate kubeconfig/kubectl
+      # access needed on the runner, just the ArgoCD credentials already
+      # used to sync
+      - name: get-catalogue-endpoint
+        id: endpoint
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -e
+          pod_ip=$(argocd app manifests ${{ inputs.argocd-app }} --source live --insecure \
+            | yq eval-all 'select(.kind == "Pod") | .status.podIP' - \
+            | head -n1)
+          if [ -z "$pod_ip" ] || [ "$pod_ip" = "null" ]; then
+            echo "No running ${component} pod found in ArgoCD app ${{ inputs.argocd-app }}"
+            exit 1
+          fi
+          echo "catalogue_url=http://${pod_ip}:8080" >> "$GITHUB_OUTPUT"
 
-      # # mirrors 'api-tests' stage — same cross-job hand-off as Jenkins'
-      # # `build job: 'ROBOSHOP/catalogue-api-tests'`, just via a workflow_dispatch
-      # # in that repo (owned by SDET) instead of a Jenkins job
-      # - name: trigger catalogue-api-tests
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GH_PAT }}
-      #   run: |
-      #     set -e
-      #     gh workflow run api-tests.yml \
-      #       --repo ${org}/catalogue-api-tests \
-      #       --ref main \
-      #       -f namespace=roboshop-dev \
-      #       -f commit_id=${{ github.sha }}
+      # mirrors 'api-tests' stage — same cross-job hand-off as Jenkins'
+      # `build job: 'ROBOSHOP/catalogue-api-tests'`, just via a workflow_dispatch
+      # in that repo (owned by SDET) instead of a Jenkins job
+      - name: trigger catalogue-api-tests
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -e
+          gh workflow run api-tests.yml \
+            --repo ${org}/catalogue-api-tests \
+            --ref main \
+            -f namespace=roboshop-dev \
+            -f commit_id=${{ github.sha }} \
+            -f catalogue_url=${{ steps.endpoint.outputs.catalogue_url }}
 
-      #     sleep 10
-      #     run_id=$(gh run list --repo ${org}/catalogue-api-tests --workflow=api-tests.yml --json databaseId,createdAt --jq 'sort_by(.createdAt) | last | .databaseId')
-      #     echo "watching catalogue-api-tests run $run_id"
-      #     gh run watch "$run_id" --repo ${org}/catalogue-api-tests --exit-status
+          sleep 10
+          run_id=$(gh run list --repo ${org}/catalogue-api-tests --workflow=api-tests.yml --json databaseId,createdAt --jq 'sort_by(.createdAt) | last | .databaseId')
+          echo "watching catalogue-api-tests run $run_id"
+          gh run watch "$run_id" --repo ${org}/catalogue-api-tests --exit-status
 
       # # mirrors 'raise-pr' stage — same create-or-find semantics as
       # # utils.createPullRequest(), scoped to this repo so the default token is enough

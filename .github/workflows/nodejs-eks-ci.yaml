@@ -205,26 +205,15 @@ jobs:
           argocd app sync ${{ inputs.argocd-app }} --insecure
           argocd app wait ${{ inputs.argocd-app }} --health --timeout 300 --insecure
 
-      # resolve the running catalogue pod's IP via ArgoCD's own view of the
-      # live cluster state (its cluster cache carries full object status,
-      # not just the health/sync summary) — no separate kubeconfig/kubectl
-      # access needed on the runner, just the ArgoCD credentials already
-      # used to sync
+      # catalogue's Service is a stable ClusterIP (templates/service.yaml in
+      # catalogue-config), so its cluster-DNS name is deterministic — no need
+      # to look up a live pod/IP via kubectl or the ArgoCD API at all. This
+      # runner lives inside the roboshop cluster (runs-on: group: roboshop),
+      # so cluster-internal DNS resolves directly.
       - name: get-catalogue-endpoint
         id: endpoint
-        env:
-          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
-          set -e
-          pod_ip=$(argocd app manifests ${{ inputs.argocd-app }} --source live --insecure \
-            | yq eval-all 'select(.kind == "Pod") | .status.podIP' - \
-            | head -n1)
-          if [ -z "$pod_ip" ] || [ "$pod_ip" = "null" ]; then
-            echo "No running ${component} pod found in ArgoCD app ${{ inputs.argocd-app }}"
-            exit 1
-          fi
-          echo "catalogue_url=http://${pod_ip}:8080" >> "$GITHUB_OUTPUT"
+          echo "catalogue_url=http://catalogue.roboshop-dev.svc.cluster.local:8080" >> "$GITHUB_OUTPUT"
 
       # mirrors 'api-tests' stage — same cross-job hand-off as Jenkins'
       # `build job: 'ROBOSHOP/catalogue-api-tests'`, just via a workflow_dispatch
